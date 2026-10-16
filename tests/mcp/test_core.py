@@ -1,118 +1,101 @@
-"""Tests per lab_connectors.mcp.core."""
+"""Tests per lab_connectors.mcp.core — guard, guard_timed, factory.
+
+Copre l'infrastruttura MCP condivisa (ex coperta anche dai test del
+server github-discussions, rimossi con la migrazione a dcl-mcp).
+"""
 
 from __future__ import annotations
 
-import time
+import logging
 
 import pytest
 
 from lab_connectors.mcp.core import DEFAULT_SLOW_MS, create_mcp_server, guard, guard_timed
 from lab_connectors.mcp.errors import ErrorCode, McpError
 
-pytestmark = pytest.mark.contract
+pytestmark = pytest.mark.pure_unit
+
+
+# ── create_mcp_server ─────────────────────────────────────────────────────────
 
 
 class TestCreateMcpServer:
-    def test_creates_fastmcp_with_name(self) -> None:
-        """create_mcp_server deve restituire un FastMCP con nome corretto."""
-        mcp = create_mcp_server("test-server", "Test instructions")
+    def test_returns_named_server(self):
+        mcp = create_mcp_server(name="test-server", instructions="test instructions")
         assert mcp.name == "test-server"
-        assert type(mcp).__name__ in {"FastMCP", "MCPServer"}
 
-    def test_creates_fastmcp_with_instructions(self) -> None:
-        """Le instructions devono essere accessibili."""
-        mcp = create_mcp_server("test", "Istruzioni di test")
-        assert "Istruzioni di test" in mcp.instructions
+    def test_raises_without_mcp_package(self, monkeypatch):
+        from lab_connectors.mcp import core
 
-    def test_fastmcp_tools_can_be_registered(self) -> None:
-        """Il server deve supportare la registrazione di strumenti."""
-        mcp = create_mcp_server("test-tools", "Test tools")
+        monkeypatch.setattr(core, "_get_fastmcp", lambda: None)
+        with pytest.raises(RuntimeError, match="non è installato"):
+            create_mcp_server(name="x", instructions="y")
 
-        @mcp.tool(description="test tool")
-        def my_tool(x: int) -> str:
-            return str(x * 2)
 
-        tools = {t if isinstance(t, str) else t.name for t in mcp._tool_manager._tools}
-        assert "my_tool" in tools
+# ── guard ─────────────────────────────────────────────────────────────────────
 
 
 class TestGuard:
-    def test_guard_success_returns_dict(self) -> None:
-        result = guard(lambda: {"ok": True})
-        assert result == {"ok": True}
+    def test_success_passthrough(self):
+        assert guard(lambda x: {"value": x}, 42) == {"value": 42}
 
-    def test_guard_passes_non_dict_result(self) -> None:
-        result = guard(lambda: "string_result")
-        assert result == "string_result"  # non wrappa più in {"result": ...}
+    def test_mcp_error_to_dict(self):
+        def boom() -> None:
+            raise McpError(ErrorCode.CONFIG_NOT_FOUND, "manca la config")
 
-    def test_guard_catches_mcp_error(self) -> None:
-        def _fail() -> None:
-            raise McpError(ErrorCode.ARTIFACT_NOT_FOUND, "Non trovato")
+        result = guard(boom)
+        assert result == {"error": "config_not_found", "message": "manca la config"}
 
-        result = guard(_fail)
-        assert result == {"error": "artifact_not_found", "message": "Non trovato"}
+    def test_generic_exception_wrapped(self):
+        def boom() -> None:
+            raise ValueError("cacchio")
 
-    def test_guard_catches_generic_exception(self) -> None:
-        def _fail() -> None:
-            raise ValueError("qualcosa è andato storto")
+        result = guard(boom)
+        assert result["error"] == ErrorCode.UNEXPECTED.value
+        assert "cacchio" in result["message"]
 
-        result = guard(_fail)
-        assert result["error"] == "unexpected_error"
-        assert "qualcosa è andato storto" in result["message"]
 
-    def test_guard_passes_args(self) -> None:
-        result = guard(lambda a, b: {"sum": a + b}, 3, 4)
-        assert result == {"sum": 7}
-
-    def test_guard_passes_kwargs(self) -> None:
-        result = guard(lambda x, y=1: {"product": x * y}, 5, y=3)
-        assert result == {"product": 15}
+# ── guard_timed ───────────────────────────────────────────────────────────────
 
 
 class TestGuardTimed:
-    def test_success_logs_and_returns(self) -> None:
-        result = guard_timed(lambda: {"ok": True}, "test_tool", logger_name="test-guard-timed")
+    def test_success_returns_result_and_logs_ok(self, caplog):
+        caplog.set_level(logging.INFO)
+        result = guard_timed(lambda: {"ok": True}, "my_tool")
         assert result == {"ok": True}
+        assert "my_tool" in caplog.text
+        assert "OK" in caplog.text
 
-    def test_error_logs_and_returns_error_dict(self) -> None:
-        def _fail() -> None:
-            raise McpError(ErrorCode.INVALID_PARAMS, "male")
+    def test_slow_call_logs_warning(self, caplog):
+        caplog.set_level(logging.WARNING)
+        guard_timed(lambda: "x", "slow_tool", slow_ms=-1)
+        assert "slow=True" in caplog.text
 
-        result = guard_timed(_fail, "test_tool_err", logger_name="test-guard-timed")
-        assert result == {"error": "invalid_params", "message": "male"}
-
-    def test_unexpected_error_logs_and_returns(self) -> None:
-        def _fail() -> None:
-            raise RuntimeError("unexpected")
-
-        result = guard_timed(_fail, "test_tool_unexpected", logger_name="test-guard-timed")
-        assert result["error"] == "unexpected_error"
-
-    def test_default_logger_name(self) -> None:
-        """Deve funzionare anche senza logger_name (default = tool_name)."""
-        result = guard_timed(lambda: {"ok": True}, "test_tool_default")
-        assert result == {"ok": True}
-
-    def test_slow_ms_default(self) -> None:
-        """slow_ms di default (5000) non altera il risultato."""
-        result = guard_timed(lambda: {"ok": True}, "test_tool", logger_name="test")
-        assert result == {"ok": True}
-
-    def test_slow_ms_zero(self) -> None:
-        """slow_ms=0 funziona (tutte le chiamate oltre soglia)."""
-        result = guard_timed(lambda: {"ok": True}, "test_tool", slow_ms=0, logger_name="test")
-        assert result == {"ok": True}
-
-    def test_slow_does_not_block_result(self) -> None:
-        """Anche se la chiamata supera slow_ms, il risultato torna corretto."""
-
-        def _slow() -> dict:
-            time.sleep(0.015)  # 15ms
-            return {"ok": "slow_but_ok"}
-
-        result = guard_timed(_slow, "slow_tool", slow_ms=1, logger_name="test")
-        assert result == {"ok": "slow_but_ok"}
-
-    def test_slow_ms_constant_exists(self) -> None:
-        """DEFAULT_SLOW_MS deve essere 5000."""
+    def test_default_slow_ms_constant(self):
         assert DEFAULT_SLOW_MS == 5000
+
+    def test_mcp_error_logged_as_warning(self, caplog):
+        caplog.set_level(logging.WARNING)
+
+        def boom() -> None:
+            raise McpError(ErrorCode.SLUG_NOT_FOUND, "slug inesistente")
+
+        result = guard_timed(boom, "err_tool")
+        assert result["error"] == "slug_not_found"
+        assert "err_tool" in caplog.text
+
+    def test_generic_exception_logged_as_error(self, caplog):
+        caplog.set_level(logging.ERROR)
+
+        def boom() -> None:
+            raise RuntimeError("disastro")
+
+        result = guard_timed(boom, "crash_tool")
+        assert result["error"] == ErrorCode.UNEXPECTED.value
+        assert "crash_tool" in caplog.text
+
+    def test_args_kwargs_forwarded(self):
+        def add(a: int, b: int = 0) -> dict[str, int]:
+            return {"sum": a + b}
+
+        assert guard_timed(add, "add_tool", 1, b=2) == {"sum": 3}
